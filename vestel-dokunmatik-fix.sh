@@ -319,8 +319,8 @@ case "${1:-}" in
         export DISPLAY=:0;for xa in /home/*/.Xauthority /root/.Xauthority;do [ -f "$xa" ]&&export XAUTHORITY="$xa"&&break;done
         # Önce kendi kalibrasyon GUI'mizi dene
         if [ -f /usr/local/bin/vestel-calibrate-gui.py ];then
-            echo -e "${C}Kalibrasyon GUI başlatılıyor (4 noktaya dokunun, ESC=iptal)...${NC}"
-            python3 /usr/local/bin/vestel-calibrate-gui.py --points 4 2>/dev/null && exit 0
+            echo -e "${C}Kalibrasyon GUI başlatılıyor (9 noktaya dokunun, ESC=iptal)...${NC}"
+            python3 /usr/local/bin/vestel-calibrate-gui.py --points 9 2>/dev/null && exit 0
         fi
         # Fallback: Vestel'in kendi araçları
         if [ -e /dev/optictouch ]||[ -e /dev/IRTouchOptical000 ];then echo -e "${C}2cam kalibrasyon (Vestel)...${NC}";/usr/bin/calibrationTools 2>/dev/null||echo -e "${R}Hata${NC}"
@@ -401,6 +401,27 @@ echo -e "  ${G}✓${NC} Kalibrasyon her boot'ta kalıcı"
 echo ""
 echo -e "  ${C}vestel-calibrate hafif/orta/buyuk/sifirla${NC}  → yazılım"
 echo -e "  ${C}vestel-calibrate donanim${NC}                   → sensör GUI"
+echo ""
+
+# Dokunmatik çalışıyorsa kalibrasyon teklif et
+echo -ne "${Y}Şimdi kalibrasyon yapmak ister misiniz? (e/h):${NC} "
+if read -t 30 -r cal_ans 2>/dev/null; then
+    case "$cal_ans" in
+        e|E|evet)
+            if [ -f /usr/local/bin/vestel-calibrate-gui.py ]; then
+                echo -e "${C}Kalibrasyon GUI açılıyor — 9 noktaya dokunun, ESC=iptal${NC}"
+                sleep 1
+                export DISPLAY=:0
+                for xa in /home/*/.Xauthority /root/.Xauthority; do [ -f "$xa" ] && export XAUTHORITY="$xa" && break; done
+                python3 /usr/local/bin/vestel-calibrate-gui.py --points 9 2>/dev/null
+            else
+                echo -e "${Y}GUI bulunamadı, hızlı preset uyguluyorum...${NC}"
+                vestel-calibrate orta 2>/dev/null
+            fi
+            ;;
+    esac
+fi
+
 echo ""
 echo -ne "${G}Reboot? (e/h):${NC} "
 read -t 60 -r ans 2>/dev/null||true
