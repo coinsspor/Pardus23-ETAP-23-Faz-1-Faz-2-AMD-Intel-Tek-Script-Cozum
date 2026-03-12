@@ -1,331 +1,248 @@
-# Vestel Akıllı Tahta — Dokunmatik Tam Otomatik Düzeltme
+# eta-touchdrv Sürücü Analizi & Çözüm Planı
 
-> **Pardus 23 / ETAP 23 | Faz-1 & Faz-2 | AMD & Intel | Tek Script Çözüm**
->
-> `xinput_calibrator` yerine `libinput Calibration Matrix` tabanlı modern çözüm
-
----
-
-## Sorun Ne?
-
-MEB okullarındaki Vestel akıllı tahtalara Pardus 23 kurulduğunda dokunmatik ekranla ilgili şu sorunlar yaşanıyor:
-
-- Dokunmatik hiç çalışmıyor
-- Dokunma noktası kayık (1-2 cm fark var)
-- Bazen çalışıyor bazen çalışmıyor
-- Çoklu dokunma (multitouch) çalışmıyor
-
-**Neden `xinput_calibrator` işe yaramıyor?**
-
-Pardus 23 artık `libinput` sürücüsünü kullanıyor. Eski `xinput_calibrator` ise `evdev` formatında çıktı veriyor (MinX/MaxX/MinY/MaxY). libinput bu formatı tanımıyor — onun yerine 3x3 "Calibration Matrix" istiyor. Yani ikisi farklı dil konuşuyor, bu yüzden `xinput_calibrator` ile ne yaparsanız yapın sonuç değişmiyor.
-
-Bu script tamamen `libinput Calibration Matrix` tabanlı çalışıyor ve sorunu kökünden çözüyor.
+> Vestel Akıllı Tahta (Faz-1 / Faz-2) — Pardus 23 Dokunmatik Sorunları
+> 
+> Analiz Tarihi: 2026-03-12
+> İncelenen Paketler: eta-touchdrv 0.3.5, eta-touchdrv 0.4.0~beta1
 
 ---
 
-## Nasıl Kullanılır?
+## 1. Mimari: Dokunmatik Nasıl Çalışıyor?
 
-### Tek Adım: USB Belleğe Kopyala → Tahtada Çift Tıkla
+Vestel akıllı tahtalardaki dokunmatik, standart USB dokunmatik panellerden farklı çalışır. Normal bir dokunmatik ekran USB HID protokolü ile "parmak şurada" diye koordinat gönderir ve Linux çekirdeği bunu direkt anlar. Vestel tahtalar ise **optik kamera sensörleri** kullanır — ekranın kenarlarındaki kızılötesi kameralar parmağın gölgesini algılar ve ham veriyi USB üzerinden gönderir.
 
-1. `vestel-dokunmatik-fix.sh` dosyasını USB belleğe kopyalayın
-2. USB belleği tahtaya takın
-3. Dosyaya çift tıklayın → **"Konsolda Çalıştır"** deyin
-4. Script her şeyi otomatik yapar
-5. Sonunda **"Yeniden başlatmak ister misiniz?"** diye sorar → **e** yazın
+Bu ham verinin dokunma koordinatına çevrilmesi için bir **userspace daemon** gerekir. İşte bu yüzden standart `hid-multitouch` veya `libinput` tek başına çalışmaz.
 
-Hepsi bu kadar. `sudo` yazmaya, şifre girmeye gerek yok.
+### Veri Akışı
 
-Alternatif olarak terminal açıp şunu da yazabilirsiniz:
-```bash
-bash vestel-dokunmatik-fix.sh
+```
+Parmak dokunur
+    ↓
+IR kamera sensörleri ham ışık verisini toplar
+    ↓
+USB üzerinden bilgisayara gönderir (vendor-specific protokol)
+    ↓
+Kernel modülü (OpticalDrv veya OtdDrv) USB verisini okur
+    → /dev/IRTouchOptical000 veya /dev/OtdUsbRaw device node oluşturur
+    ↓
+Userspace daemon (OpticalService veya OtdTouchServer) device node'u açar
+    → Ham veriyi okur
+    → Koordinat hesaplar (kalibrasyon parametrelerine göre)
+    → ioctl() ile kernel modülüne multitouch event gönderir
+    ↓
+Kernel modülü Linux input subsystem'e raporlar
+    → input_mt_slot() + ABS_MT_POSITION_X/Y
+    ↓
+libinput / X11 dokunma olayını alır
+    ↓
+Ekranda tıklama gerçekleşir
+```
+
+### İki Farklı Tahta Tipi
+
+| Özellik | 2-Kameralı (Faz-1 siyah) | 4-Kameralı (Faz-2 gri) |
+|---------|--------------------------|------------------------|
+| Kernel modülü | `OpticalDrv.ko` | `OtdDrv.ko` |
+| Userspace daemon | `OpticalService` | `OtdTouchServer` |
+| Device node | `/dev/IRTouchOptical000` | `/dev/OtdUsbRaw` |
+| Kalibrasyon aracı | `calibrationTools` | `OtdCalibrationTool` |
+| USB Vendor ID | `6615` (IRTOUCH) | `2621` (bilinmeyen üretici) |
+| USB Product ID'leri | `0084, 0085, 0086, 0087, 0088, 0c20` | `2201, 4501` |
+| Multitouch | 2 parmak | 10 parmak |
+| Koordinat aralığı | 0 – 32767 | 0 – 32767 |
+| Input protokolü | MT Type B (slot tabanlı) | MT Type B (slot tabanlı) |
+
+---
+
+## 2. Tespit Edilen Sorunlar
+
+### SORUN 1: Kernel API Uyumsuzlukları (Derleme Hatası)
+
+**v0.4.0 beta** paketinde **3 kritik** kernel uyumsuzluğu var:
+
+**1a) `raw_copy_from_user` / `raw_copy_to_user`**
+Her iki modülde toplam 9 yerde kullanılmış. Bu fonksiyonlar kernel 5.x'te deprecate edildi. Pardus 23'ün kernel'ında (6.1.x) hâlâ derleniyor olabilir ama güvenli değil ve gelecek güncellemelerde kırılacak. Doğrusu `copy_from_user` / `copy_to_user`.
+
+**1b) `strlcpy` — kernel 6.8+'da kaldırıldı**
+Her iki modülde `strlcpy` ve `strlcat` kullanılmış. Kernel 6.8 ile tamamen kaldırıldı, yerine `strscpy` geldi. Pardus 23 kernel 6.1 kullandığı için şu an çalışıyor ama kernel güncellemesi ile kırılacak.
+
+İlginç olan: **v0.3.5 paketinde** bu düzeltme yapılmış (`#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)` ile `strlcpy` → `strscpy` değişimi var), ama **v0.4.0 beta'da bu düzeltme yok**. Yani v0.4.0 bu konuda v0.3.5'ten geriye gitmiş.
+
+**1c) `class_create(THIS_MODULE, name)` — kernel 6.4+'da değişti**
+`OtdDrv.c` (4-kameralı modül) `class_create` fonksiyonunu iki parametreyle çağırıyor. Kernel 6.4'ten itibaren `THIS_MODULE` parametresi kaldırıldı, tek parametre alıyor. Pardus 23'te kernel 6.1 olduğu için şimdilik çalışıyor ama riskli.
+
+**1d) `asm/uaccess.h` — deprecated header**
+Her iki modülde `#include <asm/uaccess.h>` var. Doğrusu `linux/uaccess.h`. Bazı kernel versiyonlarında uyarı, bazılarında hata verir.
+
+### SORUN 2: DKMS Versiyon Placeholder
+
+`dkms.conf` dosyasında `PACKAGE_VERSION="__VERSION__"` yazıyor. Bu placeholder'ın paket oluşturma sırasında gerçek versiyonla değiştirilmesi gerekiyordu ama değiştirilmemiş. DKMS bu yüzden modülü yanlış versiyonla kaydedebilir veya hiç kaydedemeyebilir.
+
+### SORUN 3: `touchdrv_install` Scripti Sorunları
+
+**v0.4.0'da retry mekanizması kaldırılmış:** v0.3.5'te USB cihaz bulunamazsa 3 kere 0.5 saniye arayla deniyor. v0.4.0'da tek deneme var — USB tanıma gecikmeli olursa (özellikle boot sırasında) başarısız oluyor.
+
+**Race condition:** Servis `Restart=always` ile çalışıyor. USB cihaz bulunamazsa script çıkıyor, systemd tekrar başlatıyor, tekrar bulamıyor — sonsuz döngüye giriyor. CPU ve log şişmesine neden olur.
+
+**`set -e` ile `exec` kullanımı:** v0.3.5'te `exec /usr/bin/OtdTouchServer.$(uname -m)` ile daemon'u servis PID'si olarak başlatıyor (doğru). v0.4.0'da `exec` yok, daemon child process olarak başlıyor — servis daemon'u izleyemiyor.
+
+### SORUN 4: Kalibrasyon Aracı Device Path Uyumsuzluğu
+
+Kritik bir sorun: Kalibrasyon araçlarının beklediği device path'ler ile kernel modüllerinin oluşturduğu path'ler **farklı**:
+
+| Araç | Beklediği Path | Kernel Modülünün Oluşturduğu Path |
+|------|---------------|----------------------------------|
+| `calibrationTools` | `/dev/optictouch` | `/dev/IRTouchOptical000` |
+| `OtdCalibrationTool` | `/dev/OtdOpticTouch` | `/dev/OtdUsbRaw` |
+
+Bu, kalibrasyon araçlarının "Error: No device found!" hatası vermesine ve çalışmamasına neden olur.
+
+### SORUN 5: Kalibrasyon Kalıcılığı
+
+`calibrationTools` kalibrasyon parametrelerini USB üzerinden `SET_CALIB_PARA_X/Y` ve `SET_DEVICE_CONFIG` ioctl'ları ile doğrudan sensör donanımına (firmware'e) yazıyor. Bu parametrelerin nereye kaydedildiği belirsiz:
+
+- Sensörün kendi flash belleğine yazılıyorsa → kalıcıdır ama sensör reset olursa kaybolabilir
+- RAM'de tutuluyorsa → her güç kesintisinde kaybolur
+- `OtdTouchServer` kendi içinde `OtdStaticSaveFcbParameters` / `OtdStaticLoadCcbParameters` fonksiyonları var ama bunlar herhangi bir dosyaya yazmıyor (`/dev/OtdUsbRaw` dışında path referansı yok)
+
+Bu, "kalibrasyon yapıyorum ama yeniden başlatınca bozuluyor" sorununun ana nedeni.
+
+### SORUN 6: v0.3.5 ve v0.4.0 Arasındaki Karışıklık
+
+v0.3.5 (Eylül 2025) bazı konularda v0.4.0 beta'dan (Nisan 2025) daha iyi:
+
+| Özellik | v0.3.5 | v0.4.0 beta |
+|---------|--------|-------------|
+| strlcpy → strscpy fix | ✅ Var | ❌ Yok |
+| linux/version.h include | ✅ Var | ❌ Yok |
+| Retry mekanizması | ✅ 3 deneme | ❌ Tek deneme |
+| OtdTouchServer | Statik linkli (978KB) | Dinamik linkli (88KB) |
+| Servis After= | lightdm.service | Yok (race condition) |
+| touchdrv_restart | ✅ Var | ❌ Kaldırılmış |
+
+OtdTouchServer'ın v0.4.0'daki dinamik linkli versiyonu daha iyi (daha küçük, sistem kütüphanelerini kullanıyor) ama geri kalan her şey v0.3.5'te daha sağlam.
+
+### SORUN 7: AMD vs Intel Farkı
+
+Kaynak kodda AMD/Intel ayrımı yok — sürücü saf USB tabanlı, işlemciden bağımsız. Ama pratikte AMD tahtalarında sorun daha fazla çünkü:
+
+- AMD'nin USB controller'ı farklı zamanlama yapıyor (USB enumeration daha yavaş)
+- `touchdrv_install`'ın retry mekanizması yetersiz kalıyor
+- Boot sırasında USB cihaz henüz hazır değilken servis başlıyor
+
+---
+
+## 3. Çözüm Planı
+
+### A. Kernel Modüllerini Düzelt (Kaynak Kod Patch)
+
+Her iki modüle (OpticalDrv.c ve OtdDrv.c) şu düzeltmeler uygulanacak:
+
+1. `raw_copy_from_user` → `copy_from_user`
+2. `raw_copy_to_user` → `copy_to_user`
+3. `asm/uaccess.h` → `linux/uaccess.h`
+4. `linux/version.h` ekleme + `strlcpy` → `strscpy` uyumluluk makrosu
+5. `class_create` kernel 6.4+ uyumluluk makrosu
+6. DKMS `__VERSION__` placeholder düzeltme
+
+### B. `touchdrv_install` Scriptini Yeniden Yaz
+
+- AMD için daha uzun retry (10 deneme, 2 saniye arayla)
+- lsusb yerine `/sys/bus/usb/devices/` kontrolü (daha güvenilir)
+- Daemon'u `exec` ile başlatma
+- PID dosyası ile çift çalışma önleme
+- USB hotplug desteği
+
+### C. systemd Servisini Düzelt
+
+- `After=display-manager.service` ekleme
+- `Restart=on-failure` (always değil)
+- `RestartSec=5s` (4s yerine)
+- `StartLimitIntervalSec` ile sonsuz döngü önleme
+
+### D. Device Path Symlink'leri Oluştur
+
+Kalibrasyon araçlarının beklediği path'lere symlink:
+- `/dev/optictouch` → `/dev/IRTouchOptical000`
+- `/dev/OtdOpticTouch` → `/dev/OtdUsbRaw`
+
+udev kuralı ile otomatik.
+
+### E. Kendi Kalibrasyon Sistemimizi Yaz
+
+Mevcut `calibrationTools` ve `OtdCalibrationTool` çalışsa bile kalibrasyon kalıcı olmuyor. Çözüm:
+
+1. Kendi X11 kalibrasyon GUI'mizi yazacağız (Python + Xlib veya basit C)
+2. 4/9/16 nokta kalibrasyon desteği
+3. Hesaplanan matris `/etc/vestel-touch-calibration.conf` dosyasına kaydedilecek
+4. Her boot'ta `xinput set-prop` ile matris uygulanacak
+5. Ayrıca `OtdTouchServer`'ın koordinat dönüşümünü de patch'leyebiliriz
+
+İki katmanlı kalibrasyon:
+- **Katman 1 (donanım):** `calibrationTools` / `OtdCalibrationTool` ile sensör kalibrasyonu (çalışırsa)
+- **Katman 2 (yazılım):** `libinput Calibration Matrix` ile Linux input seviyesinde düzeltme (her zaman çalışır, kalıcı)
+
+### F. Tek Script Çözüm
+
+Tüm yukarıdaki düzeltmeleri tek bir script'e entegre edeceğiz:
+
+1. Sistemi teşhis et (AMD/Intel, tahta tipi, USB cihaz)
+2. Kernel modül kaynaklarını patch'le ve DKMS ile derle
+3. Düzeltilmiş `touchdrv_install` ve servis dosyalarını kur
+4. Device symlink'leri oluştur
+5. Kalibrasyon GUI'sini çalıştır
+6. Kalibrasyon matrisini kaydet
+7. Her boot'ta otomatik uygulama servisi kur
+
+---
+
+## 4. Dosya Referansı
+
+### Kernel Modülleri (Kaynak Kod)
+```
+/usr/src/eta-touchdrv-VERSION/touch2/OpticalDrv.c    → 2-kameralı sürücü
+/usr/src/eta-touchdrv-VERSION/touch2/OpticalDrv.h
+/usr/src/eta-touchdrv-VERSION/touch4/OtdDrv.c        → 4-kameralı sürücü
+/usr/src/eta-touchdrv-VERSION/touch4/OtdDrv.h
+/usr/src/eta-touchdrv-VERSION/dkms.conf
+```
+
+### Binary Daemon'lar (Closed-source, Vestel tarafından sağlanmış)
+```
+/usr/bin/OpticalService          → 2-kameralı daemon (35KB, dinamik linkli)
+/usr/bin/OtdTouchServer          → 4-kameralı daemon (88KB v0.4.0, 978KB v0.3.5)
+/usr/bin/OtdCalibrationTool      → 4-kameralı kalibrasyon (93KB, X11 bağımlı)
+/usr/bin/calibrationTools        → 2-kameralı kalibrasyon (44KB, X11 bağımlı)
+/usr/bin/touchdrv_install        → Başlatma scripti
+```
+
+### Sistem Dosyaları
+```
+/lib/systemd/system/eta-touchdrv.service
+/lib/udev/rules.d/60-eta-touchdrv.rules
+```
+
+### USB Device ID Tablosu
+```
+6615:0084  →  IRTOUCH 2-kamera tip 1
+6615:0085  →  IRTOUCH 2-kamera tip 2
+6615:0086  →  IRTOUCH 2-kamera tip 3
+6615:0087  →  IRTOUCH 2-kamera tip 4
+6615:0088  →  IRTOUCH 2-kamera tip 5
+6615:0c20  →  IRTOUCH 2-kamera tip 6
+2621:2201  →  4-kamera tip 1
+2621:4501  →  4-kamera tip 2
 ```
 
 ---
 
-## Script Adım Adım Ne Yapıyor?
+## 5. Sonuç
 
-### Aşama 1 — Otomatik Yetki Alma
+Ana sorun şu: Vestel'in dokunmatik sensörleri standart HID değil, özel protokol kullanıyor. Bu yüzden `eta-touchdrv` paketi şart — ama paketin kendisi hem kernel uyumsuzlukları hem de mimari hatalar içeriyor. 
 
-Script root yetkisi gerektiğini bilir ve kendisi halleder:
-
-- Önce `etap+pardus!` şifresini dener
-- Tutmazsa diğer bilinen ETAP şifrelerini dener (`etap+pardus`, `pardus`, `etapadmin`, `123456`, `pardus23`, `etap23`)
-- `sudo` ile olmadıysa `su root` ile dener
-- Hiçbiri tutmazsa 3 kere şifre sorar
-- Hiçbir durumda takılıp kalmaz
-
-### Aşama 2 — Sistem Teşhisi
-
-- Tahtanın AMD mi Intel mi olduğunu tespit eder
-- Pardus versiyonunu, kernel sürümünü kontrol eder
-- Display server tipini (X11/Wayland) belirler
-
-### Aşama 3 — USB Dokunmatik Cihaz Tespiti
-
-- USB'ye bağlı tüm cihazları tarar
-- Klavye ve mouse'u otomatik olarak atlar (USB'de takılı olsa bile sorun çıkarmaz)
-- Sadece dokunmatik çipsetlerini bulur: eGalax, ILITEK, Weida, PixArt, ELAN, Goodix, SiS, Atmel, IRTOUCH, GeneralTouch
-- Hiçbir bilinen çip bulamazsa genel HID cihazlara da bakar
-
-### Aşama 4 — Sürücü ve Paket Kurulumu
-
-Eksik olan her şeyi otomatik kurar:
-
-- `xinput` — dokunmatik cihaz yönetimi
-- `libinput-tools` — modern dokunmatik sürücü araçları
-- `xserver-xorg-input-libinput` — X11 libinput sürücüsü
-- `evtest` — dokunmatik test aracı
-
-Kernel modüllerini yükler ve kalıcı yapar:
-
-- `usbhid` — USB insan arabirimi sürücüsü
-- `hid-multitouch` — çoklu dokunma desteği
-- `hid-generic` — genel HID desteği
-
-Bu modüller Pardus 23'te bazen yüklü gelmiyor — script bunu halleder ve `/etc/modules` dosyasına ekleyerek her açılışta otomatik yüklenmesini sağlar.
-
-### Aşama 5 — Giriş Cihazı Eşleştirme
-
-İki farklı yöntemle dokunmatik cihazı bulur:
-
-1. **xinput** — X11 seviyesinde dokunmatik cihazı arar
-2. **/dev/input/event*** — Kernel seviyesinde ABS (absolute positioning) özelliği olan cihazları tarar
-
-Bazen USB'de görünüyor ama X11'de tanınmıyor — her iki katmana da bakarak bu durumu yakalar.
-
-### Aşama 6 — Yapılandırma Dosyaları
-
-Üç kritik dosya oluşturur:
-
-**X11 yapılandırma** (`/etc/X11/xorg.conf.d/99-vestel-touchscreen.conf`):
-- Tüm dokunmatik cihazları libinput sürücüsüne bağlar
-- eGalax, ILITEK, Goodix için ayrı ayrı özel kurallar tanımlar
-- Kalibrasyon matrisini uygular
-
-**udev kuralları** (`/etc/udev/rules.d/99-vestel-touchscreen.rules`):
-- Vestel'in kullandığı 10+ farklı dokunmatik çipset üreticisini vendor ID'leriyle tanıtır
-- Cihaz takıldığında otomatik olarak "dokunmatik" olarak işaretler
-- Kalibrasyon matrisini udev seviyesinde uygular
-
-**Kalibrasyon dosyası** (`/etc/vestel-touch-calibration.conf`):
-- Dokunmatik kalibrasyon matrisini saklar
-- Tüm diğer dosyalar bu merkezi dosyadan okur
-
-### Aşama 7 — Kalıcı Açılış Servisi
-
-"Bugün çalışıyor yarın çalışmıyor" sorununu çözmek için iki mekanizma kurar:
-
-**systemd servisi** (`vestel-touch-fix.service`):
-- Display manager başladıktan sonra çalışır
-- Dokunmatik cihazı bulur ve kalibrasyon matrisini uygular
-- İlk denemede bulamazsa HID modüllerini reload edip tekrar dener
-- `/var/log/vestel-dokunmatik-fix.log` dosyasına kayıt tutar
-
-**XDG autostart** (yedek mekanizma):
-- Kullanıcı oturumu açıldığında da çalışır
-- systemd servisi herhangi bir nedenle başarısız olursa devreye girer
-
-Her iki mekanizma da sudoers kuralıyla parola sormadan çalışır.
-
-### Aşama 8 — Anlık Düzeltme
-
-Reboot beklemeden hemen dokunmatik ayarlarını uygular. Script bitmeden dokunup test edebilirsiniz.
-
-### Aşama 9 — Masaüstü Kısayolları
-
-Tüm kullanıcıların masaüstüne iki ikon bırakır:
-
-- **"Dokunmatik Düzelt"** — ana scripti tekrar çalıştırır
-- **"Dokunmatik Kalibrasyon"** — hızlı kalibrasyon komutunu açar
-
-XFCE'deki "Güvenilmeyen uygulama" uyarısını da otomatik olarak atlar.
-
-### Aşama 10 — Reboot
-
-Script sonunda "Yeniden başlatmak ister misiniz?" diye sorar. "e" derseniz 3 saniyede reboot eder. İstemezseniz daha sonra kendiniz yeniden başlatabilirsiniz.
+Scriptimiz hem bu paket sorunlarını düzeltecek, hem de kendi kalibrasyon sistemiyle kalıcı bir çözüm sağlayacak. Böylece USB bellekle tüm okuldaki tahtalara dağıtılabilir, AMD/Intel fark etmez, kernel güncellemelerinde kırılmaz.
 
 ---
 
-## Dokunmatik Hiç Çalışmıyorsa
-
-Script şu sırayla çözmeye çalışır:
-
-**1. USB'de cihaz var mı?** → `lsusb` ile kontrol eder. Yoksa donanım sorunudur, fiziksel kontrol gerekir (aşağıya bakın).
-
-**2. USB'de var ama X11'de tanınmıyor mu?** → En yaygın Pardus 23 sorunu budur. Script `hid-multitouch` modülünü yükler, libinput sürücüsünü bağlar, udev kuralıyla cihazı dokunmatik olarak işaretler. Bu genellikle çözer.
-
-**3. Bazen çalışıyor bazen çalışmıyor mu?** → Açılış servisi her boot'ta cihazı kontrol eder. İlk denemede bulamazsa USB HID modüllerini reload edip 5 saniye bekleyip tekrar dener.
-
-### Fiziksel Kontroller (Script Çözemezse)
-
-Script donanımsal bir sorun tespit ederse ekrana şu önerileri verir:
-
-1. **Sensör ışıkları** — Tahtanın kenarlarındaki IR sensör ışıkları yanıyor mu? Yanmıyorsa sensör arızalıdır, servis çağırın
-2. **USB kablo** — Tahtanın arkasındaki OPS-USB kablosunu çıkarıp tekrar takın
-3. **OPS üstü hafif vurma** — Tahtanın üst kısmına (OPS hizası) hafifçe vurun, USB temasını yeniden sağlayabilir
-4. **Sensör temizliği** — Ekran kenarlarındaki sensörleri ıslak mendille silin
-5. **Tahta gönyesi** — Duvar askısında eğri duruyorsa sağa-sola kaydırarak gönyeye oturtun
-6. **Statik deşarj** — Güç kablosunu çekin, güç tuşuna 30 saniye basılı tutun, 5 dakika bekleyin, tekrar açın
-
----
-
-## Dokunmatik Kayıksa (Offset Sorunu)
-
-Dokunmatik çalışıyor ama parmağınızla bastığınız yer 1-2 cm yana kayıyorsa, kalibrasyon yapmanız gerekir.
-
-### Hızlı Kalibrasyon
-
-Terminalde veya masaüstündeki "Dokunmatik Kalibrasyon" ikonuyla:
-
-```bash
-vestel-calibrate hafif       # 0.5-1 cm kayıklık için
-vestel-calibrate orta        # 1-2 cm kayıklık için
-vestel-calibrate buyuk       # 2+ cm kayıklık için
-vestel-calibrate sifirla     # her şeyi sıfırla (fabrika ayarı)
-```
-
-`sudo` yazmaya gerek yok — komut yetkiyi otomatik alır.
-
-### Diğer Kalibrasyon Seçenekleri
-
-```bash
-vestel-calibrate ters-x      # X ekseni ters (sağ-sol ters)
-vestel-calibrate ters-y      # Y ekseni ters (üst-alt ters)
-vestel-calibrate swap-xy     # X-Y eksenleri değiştir
-```
-
-### Manuel Kalibrasyon (İleri Düzey)
-
-Kendi matris değerlerinizi girebilirsiniz:
-
-```bash
-vestel-calibrate 1.05 0 -0.025 0 1.05 -0.025 0 0 1
-```
-
-Bu 9 sayı bir 3x3 matristir:
-
-```
-⎡ a  b  c ⎤       a = X ölçek (1.0 = normal, >1 = genişlet)
-⎢ d  e  f ⎥       e = Y ölçek (1.0 = normal, >1 = genişlet)
-⎣ 0  0  1 ⎦       c = X kaydırma (negatif = sola, pozitif = sağa)
-                    f = Y kaydırma (negatif = yukarı, pozitif = aşağı)
-```
-
-Kalibrasyon anında uygulanır + kalıcı kaydedilir. Bir kere ayarladınız mı bir daha uğraşmazsınız, her açılışta aynı ayar otomatik gelir.
-
----
-
-## Tüm Okula Dağıtım
-
-### USB Bellek Yöntemi (En Kolay)
-
-1. Bir tahtada scripti çalıştırın ve test edin
-2. Aynı USB belleği diğer tahtalara götürün
-3. Her tahtada çift tıklayın → "e" deyin → reboot
-4. Kayıklık varsa `vestel-calibrate orta` çalıştırın
-
-### SSH ile Toplu Dağıtım (İleri Düzey)
-
-Tahtalar ağda erişilebilirse:
-
-```bash
-# Tüm tahta IP'lerini listele
-TAHTALAR="192.168.1.101 192.168.1.102 192.168.1.103"
-
-for IP in $TAHTALAR; do
-    echo "=== $IP ==="
-    scp vestel-dokunmatik-fix.sh root@$IP:/tmp/
-    ssh root@$IP "bash /tmp/vestel-dokunmatik-fix.sh && reboot"
-done
-```
-
----
-
-## Script Tarafından Oluşturulan Dosyalar
-
-| Dosya | Açıklama |
-|-------|----------|
-| `/etc/X11/xorg.conf.d/99-vestel-touchscreen.conf` | X11 dokunmatik yapılandırma |
-| `/etc/udev/rules.d/99-vestel-touchscreen.rules` | USB dokunmatik tanıma kuralları |
-| `/usr/local/bin/vestel-touch-fix.sh` | Açılış düzeltme scripti |
-| `/etc/systemd/system/vestel-touch-fix.service` | systemd servisi |
-| `/etc/xdg/autostart/vestel-touch-fix.desktop` | XDG autostart (yedek) |
-| `/etc/vestel-touch-calibration.conf` | Kalibrasyon matrisi |
-| `/etc/sudoers.d/vestel-touch` | Parolasız çalışma yetkisi |
-| `/usr/local/bin/vestel-calibrate` | Hızlı kalibrasyon komutu |
-| `/usr/local/bin/vestel-dokunmatik-fix.sh` | Ana scriptin sistem kopyası |
-| `~/Masaüstü/vestel-dokunmatik-duzelt.desktop` | Masaüstü kısayolu |
-| `~/Masaüstü/vestel-kalibrasyon.desktop` | Kalibrasyon kısayolu |
-
----
-
-## Sorun Giderme
-
-### "Dokunmatik cihaz bulunamadı" hatası
-- `lsusb` ile USB cihazları kontrol edin
-- OPS modülünü çıkarıp takın
-- Tahtanın üst kısmına hafifçe vurun
-- Statik deşarj yapın (fişi çek, güç tuşuna 30sn bas, 5dk bekle)
-
-### "Çalışıyor ama her açılışta bozuluyor"
-- Servis durumunu kontrol edin: `systemctl status vestel-touch-fix.service`
-- Log dosyasına bakın: `cat /var/log/vestel-dokunmatik-fix.log`
-
-### "Dokunmatik çalışıyor ama kayık"
-- `vestel-calibrate orta` deneyin
-- Olmadıysa `vestel-calibrate buyuk` deneyin
-- Hala olmadıysa manuel matris ile deneme yapın
-
-### "Çoklu dokunma çalışmıyor"
-- `lsmod | grep multitouch` ile modül kontrolü yapın
-- Bazı eski Faz-1 (siyah) tahtalarda multitouch donanımsal olarak desteklenmez
-
-### "Script çalışmıyor / izin hatası"
-- `chmod +x vestel-dokunmatik-fix.sh` ile çalıştırma izni verin
-- Veya `bash vestel-dokunmatik-fix.sh` ile çalıştırın (chmod gerekmez)
-
----
-
-## Teknik Bilgi
-
-### Neden libinput Calibration Matrix?
-
-Pardus 23 (Debian 12 tabanlı) X.Org server'da giriş cihazlarını `libinput` ile yönetir. Eski `evdev` sürücüsü hâlâ kurulabilir ama varsayılan değildir. `xinput_calibrator` projesinin bakımı, libinput ortaya çıkmadan önce durmuştur ve bu araç libinput'un beklediği matris formatında çıktı üretemez.
-
-### Desteklenen Dokunmatik Çipsetler
-
-| Üretici | Vendor ID | Tahtalar |
-|---------|-----------|----------|
-| eGalax / EETI | 0eef | Faz-1 siyah tahtalarda yaygın |
-| ILITEK | 222a | Faz-2 gri tahtalarda yaygın |
-| Weida | 2575 | Bazı Faz-2 modelleri |
-| PixArt | 1926 | Çeşitli modeller |
-| ELAN | 04f3 | Yeni nesil tahtalar |
-| Goodix | 27c6 | Yeni nesil tahtalar |
-| SiS | 0457 | Bazı modeller |
-| Atmel | 03eb | Bazı modeller |
-| IRTOUCH | 6615 | IR dokunmatik paneller |
-| GeneralTouch | 0dfc | Genel dokunmatik |
-
----
-
-## Gereksinimler
-
-- Pardus 23 veya ETAP 23 kurulu Vestel akıllı tahta
-- USB bellek (scripti taşımak için)
-- İnternet bağlantısı (ilk kurulumda paket indirmek için, sonra gerekmez)
-- USB klavye (dokunmatik çalışmıyorsa terminale komut yazmak için)
-
----
-
-## Lisans
-
-MIT — Serbestçe kullanabilir, değiştirebilir ve dağıtabilirsiniz.
-
----
-
-## İletişim
-
-- **GitHub:** [coinsspor](https://github.com/coinsspor)
-- **Twitter:** [@coinsspor](https://twitter.com/coinsspor)
-- **Web:** [coinsspor.com](https://coinsspor.com)
+*Hazırlayan: Fatih (coinsspor) & Claude*
+*Kaynak: eta-touchdrv_0.3.5 ve eta-touchdrv_0.4.0~beta1 reverse engineering*
