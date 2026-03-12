@@ -1,0 +1,1 @@
+# Pardus23-ETAP-23-Faz-1-Faz-2-AMD-Intel-Tek-Script-Cozum
