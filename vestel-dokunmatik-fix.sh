@@ -317,8 +317,14 @@ case "${1:-}" in
     ters-x)M="-1 0 1 0 1 0 0 0 1";;ters-y)M="1 0 0 0 -1 1 0 0 1";;swap-xy)M="0 1 0 1 0 0 0 0 1";;
     donanim)
         export DISPLAY=:0;for xa in /home/*/.Xauthority /root/.Xauthority;do [ -f "$xa" ]&&export XAUTHORITY="$xa"&&break;done
-        if [ -e /dev/optictouch ]||[ -e /dev/IRTouchOptical000 ];then echo -e "${C}2cam kalibrasyon...${NC}";/usr/bin/calibrationTools 2>/dev/null||echo -e "${R}Hata${NC}"
-        elif [ -e /dev/OtdOpticTouch ]||[ -e /dev/OtdUsbRaw ];then echo -e "${C}4cam kalibrasyon...${NC}";/usr/bin/OtdCalibrationTool 2>/dev/null||echo -e "${R}Hata${NC}"
+        # Önce kendi kalibrasyon GUI'mizi dene
+        if [ -f /usr/local/bin/vestel-calibrate-gui.py ];then
+            echo -e "${C}Kalibrasyon GUI başlatılıyor (4 noktaya dokunun, ESC=iptal)...${NC}"
+            python3 /usr/local/bin/vestel-calibrate-gui.py --points 4 2>/dev/null && exit 0
+        fi
+        # Fallback: Vestel'in kendi araçları
+        if [ -e /dev/optictouch ]||[ -e /dev/IRTouchOptical000 ];then echo -e "${C}2cam kalibrasyon (Vestel)...${NC}";/usr/bin/calibrationTools 2>/dev/null||echo -e "${R}Hata${NC}"
+        elif [ -e /dev/OtdOpticTouch ]||[ -e /dev/OtdUsbRaw ];then echo -e "${C}4cam kalibrasyon (Vestel)...${NC}";/usr/bin/OtdCalibrationTool 2>/dev/null||echo -e "${R}Hata${NC}"
         else echo -e "${R}Device yok${NC}";fi;exit 0;;
     "")echo "Kullanım: vestel-calibrate [hafif|orta|buyuk|sifirla|donanim|ters-x|ters-y|swap-xy]"
        echo "          vestel-calibrate 1.05 0 -0.025 0 1.05 -0.025 0 0 1";exit 0;;
@@ -341,6 +347,21 @@ echo "$MATRIX" > "$CALIB_FILE"
 echo "ALL ALL=NOPASSWD: /usr/local/bin/vestel-touch-apply.sh, /usr/local/bin/vestel-calibrate, /usr/local/bin/vestel-dokunmatik-fix.sh" > /etc/sudoers.d/vestel-touch
 chmod 440 /etc/sudoers.d/vestel-touch
 ok "vestel-calibrate komutu hazır"
+
+# Kalibrasyon GUI'yi kur (script yanında varsa)
+SCRIPT_DIR_CAL="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+GUI_PY=""
+for sd in "$SCRIPT_DIR_CAL" /media /mnt /tmp /home; do
+    found=$(find "$sd" -maxdepth 4 -name "vestel-calibrate-gui.py" -type f 2>/dev/null | head -1)
+    [ -n "$found" ] && GUI_PY="$found" && break
+done
+if [ -n "$GUI_PY" ]; then
+    cp "$GUI_PY" /usr/local/bin/vestel-calibrate-gui.py
+    chmod +x /usr/local/bin/vestel-calibrate-gui.py
+    ok "Kalibrasyon GUI kuruldu (vestel-calibrate-gui.py)"
+else
+    info "vestel-calibrate-gui.py bulunamadı — preset kalibrasyon kullanılacak"
+fi
 
 # ═══════════ 8/8: MASAÜSTÜ ═══════════
 header "8/8" "Masaüstü Kısayolları"
