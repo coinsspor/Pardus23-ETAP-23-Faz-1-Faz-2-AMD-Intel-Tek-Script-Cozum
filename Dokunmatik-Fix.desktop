@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Dokunmatik Fix
+Comment=Vestel akilli tahta dokunmatik surucu kurulum
+Exec=bash -c 'SCRIPT=$(find /media /mnt /home -maxdepth 5 -name "vestel-fix.sh" -type f 2>/dev/null | head -1); [ -n "$SCRIPT" ] && bash "$SCRIPT" || bash ~/Masaüstü/vestel-fix.sh; echo; read -p "Enter ile kapat..."'
+Icon=input-touchscreen
+Terminal=true
+Categories=System;

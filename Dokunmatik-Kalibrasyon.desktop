@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Dokunmatik Kalibrasyon
+Comment=Vestel akilli tahta 9 noktali dokunmatik kalibrasyon
+Exec=bash -c 'SCRIPT=$(find /media /mnt /home -maxdepth 5 -name "vestel-calibrate-gui.py" -type f 2>/dev/null | head -1); [ -n "$SCRIPT" ] && sudo python3 "$SCRIPT" || sudo python3 ~/Masaüstü/vestel-calibrate-gui.py; echo; read -p "Enter ile kapat..."'
+Icon=preferences-desktop-display
+Terminal=true
+Categories=System;

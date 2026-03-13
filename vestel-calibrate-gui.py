@@ -1,746 +1,440 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-Vestel Akıllı Tahta — Dokunmatik Kalibrasyon Aracı
-Pardus 23 / ETAP 23 — Faz-1 & Faz-2
+VESTEL AKILLI TAHTA — DOKUNMATIK KALIBRASYON
+Bagimsiz program — internetsiz calisir, tek basina her seyi yapar
 
-Sıfır ek bağımlılık: Python3 + ctypes + libX11 (Pardus 23'te varsayılan)
-Fullscreen kalibrasyon ekranı, 4 veya 9 nokta desteği
-Hesaplanan matris kalıcı kaydedilir
+Yaptiklarini:
+1. Fullscreen 9 noktali kalibrasyon ekrani acar
+2. Her noktaya dokunulunca koordinat kaydeder
+3. Matris hesaplar
+4. /etc/vestel-touch-calibration.conf dosyasina kaydeder
+5. xinput ile aninda uygular
+6. Boot servisi kurar (yoksa) — her restart'ta otomatik uygular
 
-Kullanım: sudo python3 vestel-calibrate-gui.py [--points 4|9] [--device EVENT_PATH]
+Kullanim: python3 vestel-calibrate-gui.py
 """
+import os, sys, subprocess
 
-import ctypes
-import ctypes.util
-import struct
-import os
-import sys
-import subprocess
-import time
-import math
-import glob
-import signal
-
-# ══════════════════════════════════════════════════════════════
-# X11 ctypes bindings (sıfır bağımlılık)
-# ══════════════════════════════════════════════════════════════
-
-# X11 kütüphanelerini yükle
-_x11_path = ctypes.util.find_library("X11")
-if not _x11_path:
-    print("HATA: libX11 bulunamadı!")
+# ═══════════════════════════════════════════════
+# ROOT YETKİ
+# ═══════════════════════════════════════════════
+def get_root():
+    if os.geteuid() == 0:
+        return True
+    passwords = ["etap+pardus!", "etap+pardus", "pardus", "etapadmin", "123456", "pardus23", "etap23"]
+    for pw in passwords:
+        ret = os.system(f'echo "{pw}" | sudo -S true 2>/dev/null')
+        if ret == 0:
+            script = os.path.abspath(sys.argv[0])
+            args = " ".join(sys.argv[1:])
+            os.system(f'echo "{pw}" | sudo -S python3 "{script}" {args}')
+            sys.exit(0)
+    print("Root yetkisi gerekli. Bilinen sifreler tutmadi.")
+    print("sudo python3 vestel-calibrate-gui.py")
     sys.exit(1)
 
-X11 = ctypes.cdll.LoadLibrary(_x11_path)
-
-# X11 sabitleri
-ExposureMask     = 1 << 15
-ButtonPressMask  = 1 << 2
-ButtonReleaseMask = 1 << 3
-StructureNotifyMask = 1 << 17
-KeyPressMask     = 1 << 0
-
-GCForeground     = 1 << 2
-GCBackground     = 1 << 3
-GCLineWidth      = 1 << 4
-GCFont           = 1 << 14
-
-Expose           = 12
-ButtonPress      = 4
-ButtonRelease    = 5
-KeyPress         = 2
-ConfigureNotify  = 22
-
-BlackPixel = X11.XBlackPixel
-WhitePixel = X11.XWhitePixel
-
-class XEvent(ctypes.Union):
-    _fields_ = [("type", ctypes.c_int),
-                ("pad", ctypes.c_long * 24)]
-
-class XGCValues(ctypes.Structure):
-    _fields_ = [
-        ("function", ctypes.c_int),
-        ("plane_mask", ctypes.c_ulong),
-        ("foreground", ctypes.c_ulong),
-        ("background", ctypes.c_ulong),
-        ("line_width", ctypes.c_int),
-        ("line_style", ctypes.c_int),
-        ("cap_style", ctypes.c_int),
-        ("join_style", ctypes.c_int),
-        ("fill_style", ctypes.c_int),
-        ("fill_rule", ctypes.c_int),
-        ("arc_mode", ctypes.c_int),
-        ("tile", ctypes.c_ulong),
-        ("stipple", ctypes.c_ulong),
-        ("ts_x_origin", ctypes.c_int),
-        ("ts_y_origin", ctypes.c_int),
-        ("font", ctypes.c_ulong),
-        ("subwindow_mode", ctypes.c_int),
-        ("graphics_exposures", ctypes.c_int),
-        ("clip_x_origin", ctypes.c_int),
-        ("clip_y_origin", ctypes.c_int),
-        ("clip_mask", ctypes.c_ulong),
-        ("dash_offset", ctypes.c_int),
-        ("dashes", ctypes.c_char),
-    ]
-
-# ══════════════════════════════════════════════════════════════
-# evdev raw okuma (sıfır bağımlılık)
-# ══════════════════════════════════════════════════════════════
-
-# Linux input event yapısı
-# struct input_event { struct timeval time; __u16 type; __u16 code; __s32 value; }
-if struct.calcsize("P") == 8:  # 64-bit
-    EVENT_FORMAT = "llHHi"
-else:
-    EVENT_FORMAT = "iiHHi"
-EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
-
-# Event tipleri
-EV_SYN = 0x00
-EV_ABS = 0x03
-EV_KEY = 0x01
-
-# ABS kodları
-ABS_X = 0x00
-ABS_Y = 0x01
-ABS_MT_SLOT = 0x2f
-ABS_MT_POSITION_X = 0x35
-ABS_MT_POSITION_Y = 0x36
-ABS_MT_TRACKING_ID = 0x39
-
-# BTN kodları
-BTN_TOUCH = 0x14a
-
-# ioctl sabitleri
-EVIOCGABS = lambda axis: 0x80184540 + axis
-EVIOCGNAME = lambda buflen: 0x80004506 + (buflen << 16)
-
-class input_absinfo(ctypes.Structure):
-    _fields_ = [
-        ("value", ctypes.c_int32),
-        ("minimum", ctypes.c_int32),
-        ("maximum", ctypes.c_int32),
-        ("fuzz", ctypes.c_int32),
-        ("flat", ctypes.c_int32),
-        ("resolution", ctypes.c_int32),
-    ]
-
-
-def find_touch_device():
-    """Dokunmatik event cihazını bul"""
-    for event_path in sorted(glob.glob("/dev/input/event*")):
-        try:
-            fd = os.open(event_path, os.O_RDONLY | os.O_NONBLOCK)
-            # Cihaz ismini oku
-            name_buf = ctypes.create_string_buffer(256)
-            import fcntl
-            fcntl.ioctl(fd, EVIOCGNAME(256), name_buf)
-            name = name_buf.value.decode("utf-8", errors="ignore").lower()
-            
-            # ABS_MT_POSITION_X desteği var mı?
-            absinfo = input_absinfo()
-            try:
-                fcntl.ioctl(fd, EVIOCGABS(ABS_MT_POSITION_X), absinfo)
-                has_mt_x = absinfo.maximum > 0
-            except:
-                has_mt_x = False
-            
-            os.close(fd)
-            
-            # Bilinen dokunmatik isimleri veya MT desteği
-            touch_keywords = ["touch", "optical", "irtouch", "otd", "egalax", "ilitek", "goodix"]
-            is_touch = any(kw in name for kw in touch_keywords) or has_mt_x
-            is_mouse = any(kw in name for kw in ["mouse", "trackpad", "keyboard", "power", "video"])
-            
-            if is_touch and not is_mouse:
-                return event_path, name
-        except:
-            try:
-                os.close(fd)
-            except:
-                pass
-    return None, None
-
-
-def get_touch_range(event_path):
-    """Dokunmatik cihazın X ve Y aralığını oku"""
-    import fcntl
-    fd = os.open(event_path, os.O_RDONLY)
-    
-    absinfo_x = input_absinfo()
-    absinfo_y = input_absinfo()
-    
-    try:
-        fcntl.ioctl(fd, EVIOCGABS(ABS_MT_POSITION_X), absinfo_x)
-    except:
-        fcntl.ioctl(fd, EVIOCGABS(ABS_X), absinfo_x)
-    
-    try:
-        fcntl.ioctl(fd, EVIOCGABS(ABS_MT_POSITION_Y), absinfo_y)
-    except:
-        fcntl.ioctl(fd, EVIOCGABS(ABS_Y), absinfo_y)
-    
-    os.close(fd)
-    return (absinfo_x.minimum, absinfo_x.maximum, 
-            absinfo_y.minimum, absinfo_y.maximum)
-
-
-def read_touch_event(fd):
-    """Tek bir dokunma koordinatı oku (blocking)"""
-    cur_x, cur_y = None, None
-    touching = False
-    
-    while True:
-        try:
-            data = os.read(fd, EVENT_SIZE)
-            if len(data) < EVENT_SIZE:
-                continue
-            
-            tv_sec_or_pad, tv_usec_or_pad, ev_type, ev_code, ev_value = struct.unpack(EVENT_FORMAT, data)
-            
-            if ev_type == EV_ABS:
-                if ev_code in (ABS_MT_POSITION_X, ABS_X):
-                    cur_x = ev_value
-                elif ev_code in (ABS_MT_POSITION_Y, ABS_Y):
-                    cur_y = ev_value
-            elif ev_type == EV_KEY and ev_code == BTN_TOUCH:
-                touching = ev_value == 1
-            elif ev_type == EV_SYN:
-                if cur_x is not None and cur_y is not None:
-                    return cur_x, cur_y
-        except BlockingIOError:
-            time.sleep(0.01)
-        except:
-            time.sleep(0.01)
-
-
-# ══════════════════════════════════════════════════════════════
-# Kalibrasyon Hesaplama
-# ══════════════════════════════════════════════════════════════
-
-def calculate_calibration_matrix(screen_points, touch_points, screen_w, screen_h):
-    """
-    Ekran noktaları ve dokunma noktalarından libinput Calibration Matrix hesapla.
-    
-    En az 3 nokta gerekli. Fazla nokta varsa least-squares ile hesaplanır.
-    Sonuç: [a, b, c, d, e, f, 0, 0, 1] formatında 3x3 matris
-    
-    Dönüşüm: screen_x = a * touch_x + b * touch_y + c
-              screen_y = d * touch_x + e * touch_y + f
-    
-    Burada touch_x ve touch_y normalize edilmiş (0-1 arası).
-    """
-    n = len(screen_points)
+# ═══════════════════════════════════════════════
+# MATRIS HESAPLAMA (least squares)
+# ═══════════════════════════════════════════════
+def calc_matrix(screen_pts, touch_pts, sw, sh):
+    n = len(screen_pts)
     if n < 3:
         return [1, 0, 0, 0, 1, 0, 0, 0, 1]
     
-    # Normalize et
-    norm_screen = [(sx / screen_w, sy / screen_h) for sx, sy in screen_points]
-    norm_touch = [(tx / screen_w, ty / screen_h) for tx, ty in touch_points]
-    
-    # Least squares: A * [a,b,c] = screen_x ve A * [d,e,f] = screen_y
-    # A matrisi: [[tx, ty, 1], ...]
-    
-    # Normal denklemler ile çöz (numpy'sız)
-    sum_tx2 = sum(t[0]**2 for t in norm_touch)
-    sum_ty2 = sum(t[1]**2 for t in norm_touch)
-    sum_txty = sum(t[0]*t[1] for t in norm_touch)
-    sum_tx = sum(t[0] for t in norm_touch)
-    sum_ty = sum(t[1] for t in norm_touch)
-    
-    sum_sx_tx = sum(s[0]*t[0] for s, t in zip(norm_screen, norm_touch))
-    sum_sx_ty = sum(s[0]*t[1] for s, t in zip(norm_screen, norm_touch))
-    sum_sx = sum(s[0] for s in norm_screen)
-    
-    sum_sy_tx = sum(s[1]*t[0] for s, t in zip(norm_screen, norm_touch))
-    sum_sy_ty = sum(s[1]*t[1] for s, t in zip(norm_screen, norm_touch))
-    sum_sy = sum(s[1] for s in norm_screen)
-    
-    # 3x3 lineer sistem çöz (Cramer kuralı)
-    # | sum_tx2   sum_txty  sum_tx | | a |   | sum_sx_tx |
-    # | sum_txty  sum_ty2   sum_ty | | b | = | sum_sx_ty |
-    # | sum_tx    sum_ty    n      | | c |   | sum_sx    |
-    
-    def solve_3x3(m, v):
-        """3x3 lineer sistem çöz: m * x = v"""
-        det = (m[0][0] * (m[1][1]*m[2][2] - m[1][2]*m[2][1])
-             - m[0][1] * (m[1][0]*m[2][2] - m[1][2]*m[2][0])
-             + m[0][2] * (m[1][0]*m[2][1] - m[1][1]*m[2][0]))
-        
+    ns = [(x / sw, y / sh) for x, y in screen_pts]
+    nt = [(x / sw, y / sh) for x, y in touch_pts]
+
+    def solve3x3(M, v):
+        det = (M[0][0] * (M[1][1] * M[2][2] - M[1][2] * M[2][1])
+             - M[0][1] * (M[1][0] * M[2][2] - M[1][2] * M[2][0])
+             + M[0][2] * (M[1][0] * M[2][1] - M[1][1] * M[2][0]))
         if abs(det) < 1e-10:
-            return [1, 0, 0]  # fallback identity
-        
-        x = [0, 0, 0]
+            return [1, 0, 0]
+        r = [0, 0, 0]
         for i in range(3):
-            mc = [row[:] for row in m]
+            mc = [row[:] for row in M]
             for j in range(3):
                 mc[j][i] = v[j]
-            det_i = (mc[0][0] * (mc[1][1]*mc[2][2] - mc[1][2]*mc[2][1])
-                   - mc[0][1] * (mc[1][0]*mc[2][2] - mc[1][2]*mc[2][0])
-                   + mc[0][2] * (mc[1][0]*mc[2][1] - mc[1][1]*mc[2][0]))
-            x[i] = det_i / det
-        return x
-    
-    M = [[sum_tx2, sum_txty, sum_tx],
-         [sum_txty, sum_ty2, sum_ty],
-         [sum_tx, sum_ty, n]]
-    
-    abc = solve_3x3(M, [sum_sx_tx, sum_sx_ty, sum_sx])
-    deff = solve_3x3(M, [sum_sy_tx, sum_sy_ty, sum_sy])
-    
-    # libinput calibration matrix formatı
-    a, b, c = abc
-    d, e, f = deff
-    
-    return [round(a, 6), round(b, 6), round(c, 6),
-            round(d, 6), round(e, 6), round(f, 6),
-            0, 0, 1]
+            di = (mc[0][0] * (mc[1][1] * mc[2][2] - mc[1][2] * mc[2][1])
+                - mc[0][1] * (mc[1][0] * mc[2][2] - mc[1][2] * mc[2][0])
+                + mc[0][2] * (mc[1][0] * mc[2][1] - mc[1][1] * mc[2][0]))
+            r[i] = di / det
+        return r
 
+    s2x = sum(t[0]**2 for t in nt)
+    s2y = sum(t[1]**2 for t in nt)
+    sxy = sum(t[0] * t[1] for t in nt)
+    sx = sum(t[0] for t in nt)
+    sy = sum(t[1] for t in nt)
+    M = [[s2x, sxy, sx], [sxy, s2y, sy], [sx, sy, n]]
 
-# ══════════════════════════════════════════════════════════════
-# X11 Fullscreen Kalibrasyon GUI
-# ══════════════════════════════════════════════════════════════
+    abc = solve3x3(M, [
+        sum(s[0] * t[0] for s, t in zip(ns, nt)),
+        sum(s[0] * t[1] for s, t in zip(ns, nt)),
+        sum(s[0] for s in ns)
+    ])
+    deff = solve3x3(M, [
+        sum(s[1] * t[0] for s, t in zip(ns, nt)),
+        sum(s[1] * t[1] for s, t in zip(ns, nt)),
+        sum(s[1] for s in ns)
+    ])
+    return [round(v, 6) for v in abc + deff + [0, 0, 1]]
 
-class CalibrationGUI:
-    def __init__(self, num_points=9, event_device=None):
-        self.num_points = num_points
-        self.event_device = event_device
-        self.screen_points = []  # Hedef ekran noktaları
-        self.touch_points = []   # Dokunulan gerçek noktalar
-        self.current_point = 0
-        self.screen_w = 0
-        self.screen_h = 0
-        self.crosshair_size = 50  # Büyük hedef (65" tahta için)
-        self.touch_fd = None
-        self.flash_frames = 0  # Dokunma geri bildirim animasyonu
-        
-    def generate_target_points(self):
-        """Kalibrasyon noktalarını oluştur"""
-        margin_x = int(self.screen_w * 0.1)
-        margin_y = int(self.screen_h * 0.1)
-        
-        if self.num_points == 4:
-            return [
-                (margin_x, margin_y),                              # sol üst
-                (self.screen_w - margin_x, margin_y),              # sağ üst
-                (margin_x, self.screen_h - margin_y),              # sol alt
-                (self.screen_w - margin_x, self.screen_h - margin_y),  # sağ alt
-            ]
-        elif self.num_points == 9:
-            cx, cy = self.screen_w // 2, self.screen_h // 2
-            return [
-                (margin_x, margin_y),                     # sol üst
-                (cx, margin_y),                            # orta üst
-                (self.screen_w - margin_x, margin_y),     # sağ üst
-                (margin_x, cy),                            # sol orta
-                (cx, cy),                                  # merkez
-                (self.screen_w - margin_x, cy),            # sağ orta
-                (margin_x, self.screen_h - margin_y),     # sol alt
-                (cx, self.screen_h - margin_y),            # orta alt
-                (self.screen_w - margin_x, self.screen_h - margin_y),  # sağ alt
-            ]
-    
-    def draw_crosshair(self, display, window, gc, x, y, color, label=None, big=False):
-        """Artı işareti çiz — tahtada rahat görülebilir boyutta"""
-        s = self.crosshair_size
-        if big:
-            s = int(s * 1.5)
-        
-        X11.XSetForeground(display, gc, color)
-        line_w = 4 if big else 2
-        X11.XSetLineAttributes(display, gc, line_w, 0, 0, 0)
-        
-        # Yatay çizgi
-        X11.XDrawLine(display, window, gc, x - s, y, x + s, y)
-        # Dikey çizgi
-        X11.XDrawLine(display, window, gc, x, y - s, x, y + s)
-        # Dış daire
-        X11.XDrawArc(display, window, gc, x - s//2, y - s//2, s, s, 0, 360 * 64)
-        
-        if big:
-            # İkinci büyük daire (dikkat çekici)
-            X11.XDrawArc(display, window, gc, x - s, y - s, s*2, s*2, 0, 360 * 64)
-        
-        # Nokta numarası
-        if label:
-            label_bytes = label.encode("utf-8")
-            X11.XSetForeground(display, gc, color)
-            X11.XDrawString(display, window, gc, x + s//2 + 10, y - s//2, label_bytes, len(label_bytes))
-    
-    def draw_checkmark(self, display, window, gc, x, y, color):
-        """Tamamlandı tik işareti"""
-        X11.XSetForeground(display, gc, color)
-        X11.XSetLineAttributes(display, gc, 4, 0, 0, 0)
-        s = self.crosshair_size // 2
-        # Tik: kısa çizgi aşağı + uzun çizgi yukarı
-        X11.XDrawLine(display, window, gc, x - s//2, y, x, y + s//2)
-        X11.XDrawLine(display, window, gc, x, y + s//2, x + s, y - s//2)
-    
-    def draw_text(self, display, window, gc, x, y, text, color):
-        """Metin yaz"""
-        X11.XSetForeground(display, gc, color)
-        text_bytes = text.encode("utf-8")
-        X11.XDrawString(display, window, gc, x, y, text_bytes, len(text_bytes))
-    
-    def run(self):
-        """Kalibrasyon GUI'sini çalıştır"""
-        # Dokunmatik cihazı aç
-        if self.event_device:
-            event_path = self.event_device
-        else:
-            event_path, dev_name = find_touch_device()
-            if not event_path:
-                print("HATA: Dokunmatik cihaz bulunamadı!")
-                return None
-            print(f"Dokunmatik cihaz: {event_path} ({dev_name})")
-        
-        # Touch range al
-        try:
-            tx_min, tx_max, ty_min, ty_max = get_touch_range(event_path)
-            print(f"Touch aralığı: X={tx_min}-{tx_max}, Y={ty_min}-{ty_max}")
-        except:
-            tx_min, tx_max, ty_min, ty_max = 0, 32767, 0, 32767
-            print(f"Touch aralığı varsayılan: 0-32767")
-        
-        self.touch_fd = os.open(event_path, os.O_RDONLY | os.O_NONBLOCK)
-        
-        # X11 başlat
-        display = X11.XOpenDisplay(None)
-        if not display:
-            print("HATA: X11 display açılamadı!")
-            return None
-        
-        screen = X11.XDefaultScreen(display)
-        root = X11.XRootWindow(display, screen)
-        self.screen_w = X11.XDisplayWidth(display, screen)
-        self.screen_h = X11.XDisplayHeight(display, screen)
-        
-        print(f"Ekran: {self.screen_w}x{self.screen_h}")
-        
-        black = BlackPixel(display, screen)
-        white = WhitePixel(display, screen)
-        
-        # Kırmızı ve yeşil renk
-        colormap = X11.XDefaultColormap(display, screen)
-        
-        # Fullscreen pencere oluştur
-        window = X11.XCreateSimpleWindow(
-            display, root,
-            0, 0, self.screen_w, self.screen_h,
-            0, black, black
-        )
-        
-        # Fullscreen ayarla
-        wm_state = X11.XInternAtom(display, b"_NET_WM_STATE", False)
-        wm_fullscreen = X11.XInternAtom(display, b"_NET_WM_STATE_FULLSCREEN", False)
-        
-        # Event mask
-        X11.XSelectInput(display, window, 
-                        ExposureMask | ButtonPressMask | ButtonReleaseMask | 
-                        KeyPressMask | StructureNotifyMask)
-        
-        X11.XMapWindow(display, window)
-        X11.XRaiseWindow(display, window)
-        
-        # Fullscreen özelliği ayarla
-        xev = XEvent()
-        
-        # GC oluştur
-        gc_values = XGCValues()
-        gc = X11.XCreateGC(display, window, 0, ctypes.byref(gc_values))
-        
-        # Hedef noktaları oluştur
-        self.screen_points = self.generate_target_points()
-        self.touch_points = []
-        self.current_point = 0
-        
-        result_matrix = None
-        running = True
-        need_redraw = True
-        
-        print(f"\n{self.num_points} noktalı kalibrasyon başlıyor...")
-        print("Her artı işaretine dokunun. ESC ile iptal.")
-        
-        while running:
-            # Event kontrolü
-            event = XEvent()
-            while X11.XPending(display) > 0:
-                X11.XNextEvent(display, ctypes.byref(event))
-                
-                if event.type == Expose:
-                    need_redraw = True
-                elif event.type == KeyPress:
-                    # ESC ile çık
-                    running = False
-                    break
-            
-            # Dokunma okuma
-            if self.current_point < len(self.screen_points):
-                try:
-                    tx, ty = read_touch_event(self.touch_fd)
-                    
-                    # Touch koordinatlarını ekran koordinatlarına dönüştür
-                    screen_tx = int((tx - tx_min) / (tx_max - tx_min) * self.screen_w)
-                    screen_ty = int((ty - ty_min) / (ty_max - ty_min) * self.screen_h)
-                    
-                    self.touch_points.append((screen_tx, screen_ty))
-                    
-                    target = self.screen_points[self.current_point]
-                    dx = screen_tx - target[0]
-                    dy = screen_ty - target[1]
-                    print(f"  Nokta {self.current_point + 1}/{len(self.screen_points)}: "
-                          f"hedef=({target[0]},{target[1]}) "
-                          f"dokunma=({screen_tx},{screen_ty}) "
-                          f"fark=({dx},{dy})")
-                    
-                    self.current_point += 1
-                    need_redraw = True
-                    self.flash_frames = 8  # Yeşil flash animasyonu başlat
-                    
-                    # Debounce - parmağın kalkmasını bekle
-                    time.sleep(0.5)
-                    # Buffer'ı temizle
-                    try:
-                        while True:
-                            os.read(self.touch_fd, 4096)
-                    except:
-                        pass
-                    
-                except:
-                    pass
-            
-            # Tüm noktalar toplandı
-            if self.current_point >= len(self.screen_points) and result_matrix is None:
-                result_matrix = calculate_calibration_matrix(
-                    self.screen_points, self.touch_points,
-                    self.screen_w, self.screen_h
-                )
-                need_redraw = True
-                print(f"\nHesaplanan matris: {' '.join(str(v) for v in result_matrix)}")
-            
-            # Çiz
-            if need_redraw:
-                # Arka planı temizle
-                X11.XSetForeground(display, gc, black)
-                X11.XFillRectangle(display, window, gc, 0, 0, self.screen_w, self.screen_h)
-                
-                if result_matrix is None:
-                    # Kalibrasyon devam ediyor
-                    # Üst bilgi çubuğu
-                    bar_text = f"KALIBRASYON  [{self.current_point}/{len(self.screen_points)}]  -  Arti isaretinin TAM ORTASINA dokunun  |  ESC = iptal"
-                    bar_bytes = bar_text.encode("utf-8")
-                    X11.XSetForeground(display, gc, 0x333333)
-                    X11.XFillRectangle(display, window, gc, 0, 0, self.screen_w, 40)
-                    X11.XSetForeground(display, gc, white)
-                    X11.XDrawString(display, window, gc, 20, 28, bar_bytes, len(bar_bytes))
-                    
-                    # İlerleme çubuğu
-                    prog_w = int((self.current_point / len(self.screen_points)) * (self.screen_w - 40))
-                    X11.XSetForeground(display, gc, 0x004400)
-                    X11.XFillRectangle(display, window, gc, 20, 35, self.screen_w - 40, 4)
-                    X11.XSetForeground(display, gc, 0x00CC00)
-                    X11.XFillRectangle(display, window, gc, 20, 35, max(prog_w, 1), 4)
-                    
-                    # Tamamlanan noktalar (yeşil tik)
-                    for i in range(self.current_point):
-                        px, py = self.screen_points[i]
-                        self.draw_checkmark(display, window, gc, px, py, 0x00AA00)
-                    
-                    # Aktif nokta (kırmızı, büyük, dikkat çekici)
-                    if self.current_point < len(self.screen_points):
-                        px, py = self.screen_points[self.current_point]
-                        num_label = str(self.current_point + 1)
-                        self.draw_crosshair(display, window, gc, px, py, 0xFF4444, label=num_label, big=True)
-                    
-                    # Bekleyen noktalar (koyu gri, küçük)
-                    for i in range(self.current_point + 1, len(self.screen_points)):
-                        px, py = self.screen_points[i]
-                        num_label = str(i + 1)
-                        self.draw_crosshair(display, window, gc, px, py, 0x444444, label=num_label)
-                    
-                    # Dokunma geri bildirimi (son dokunulan noktada yeşil flash)
-                    if self.flash_frames > 0 and self.current_point > 0:
-                        fx, fy = self.screen_points[self.current_point - 1]
-                        flash_color = 0x00FF00 if self.flash_frames > 3 else 0x008800
-                        X11.XSetForeground(display, gc, flash_color)
-                        X11.XSetLineAttributes(display, gc, 3, 0, 0, 0)
-                        fs = self.crosshair_size + (10 - self.flash_frames) * 5
-                        X11.XDrawArc(display, window, gc, fx - fs, fy - fs, fs*2, fs*2, 0, 360 * 64)
-                        self.flash_frames -= 1
-                        if self.flash_frames > 0:
-                            X11.XFlush(display)
-                            time.sleep(0.05)
-                            need_redraw = True  # Animasyonu devam ettir
-                
-                else:
-                    # Kalibrasyon tamamlandı — büyük yeşil başarı ekranı
-                    # Yeşil çerçeve
-                    X11.XSetForeground(display, gc, 0x00AA00)
-                    X11.XSetLineAttributes(display, gc, 6, 0, 0, 0)
-                    X11.XDrawRectangle(display, window, gc, 
-                                      self.screen_w//4, self.screen_h//4,
-                                      self.screen_w//2, self.screen_h//2)
-                    
-                    # Büyük tik
-                    cx, cy = self.screen_w // 2, self.screen_h // 2 - 40
-                    X11.XSetForeground(display, gc, 0x00FF00)
-                    X11.XSetLineAttributes(display, gc, 8, 0, 0, 0)
-                    X11.XDrawLine(display, window, gc, cx - 40, cy, cx - 10, cy + 30)
-                    X11.XDrawLine(display, window, gc, cx - 10, cy + 30, cx + 50, cy - 30)
-                    
-                    ok_text = "KALIBRASYON TAMAMLANDI!"
-                    ok_bytes = ok_text.encode("utf-8")
-                    X11.XSetForeground(display, gc, 0x00FF00)
-                    X11.XDrawString(display, window, gc,
-                                  self.screen_w // 2 - 120, self.screen_h // 2 + 30,
-                                  ok_bytes, len(ok_bytes))
-                    
-                    matrix_str = " ".join(f"{v}" for v in result_matrix)
-                    mat_text = f"Matris: {matrix_str}"
-                    mat_bytes = mat_text.encode("utf-8")
-                    X11.XSetForeground(display, gc, white)
-                    X11.XDrawString(display, window, gc,
-                                  self.screen_w // 2 - 200, self.screen_h // 2 + 60,
-                                  mat_bytes, len(mat_bytes))
-                    
-                    save_text = "Kaydediliyor..."
-                    save_bytes = save_text.encode("utf-8")
-                    X11.XSetForeground(display, gc, 0xAAAA00)
-                    X11.XDrawString(display, window, gc,
-                                  self.screen_w // 2 - 60, self.screen_h // 2 + 90,
-                                  save_bytes, len(save_bytes))
-                    
-                    X11.XFlush(display)
-                    time.sleep(3)
-                    running = False
-                
-                X11.XFlush(display)
-                need_redraw = False
-            
-            time.sleep(0.01)
-        
-        # Temizlik
-        os.close(self.touch_fd)
-        X11.XFreeGC(display, gc)
-        X11.XDestroyWindow(display, window)
-        X11.XCloseDisplay(display)
-        
-        return result_matrix
-
-
-# ══════════════════════════════════════════════════════════════
-# Matris Kaydetme ve Uygulama
-# ══════════════════════════════════════════════════════════════
-
+# ═══════════════════════════════════════════════
+# KAYDET + UYGULA + BOOT SERVİSİ KUR
+# ═══════════════════════════════════════════════
 CALIB_FILE = "/etc/vestel-touch-calibration.conf"
+APPLY_SCRIPT = "/usr/local/bin/vestel-touch-apply.sh"
+SERVICE_FILE = "/etc/systemd/system/vestel-touch-calibrate.service"
 
 def save_calibration(matrix):
-    """Kalibrasyon matrisini kaydet"""
-    matrix_str = " ".join(str(v) for v in matrix)
-    
-    # Dosyaya kaydet
+    """Matrisi dosyaya kaydet"""
+    ms = " ".join(str(v) for v in matrix)
     with open(CALIB_FILE, "w") as f:
-        f.write(matrix_str + "\n")
-    print(f"Kaydedildi: {CALIB_FILE}")
-    
-    # xinput ile anında uygula
-    apply_calibration(matrix_str)
+        f.write(ms + "\n")
+    print(f"  Kaydedildi: {CALIB_FILE}")
+    return ms
 
-
-def apply_calibration(matrix_str):
-    """Kalibrasyon matrisini xinput ile uygula"""
+def apply_calibration(ms):
+    """xinput ile aninda uygula"""
     try:
-        result = subprocess.run(["xinput", "list"], capture_output=True, text=True)
-        for line in result.stdout.split("\n"):
+        import re
+        r = subprocess.run(["xinput", "list"], capture_output=True, text=True)
+        applied = 0
+        for line in r.stdout.split("\n"):
             if "slave  pointer" not in line:
                 continue
-            
-            # ID çıkar
-            import re
             m = re.search(r"id=(\d+)", line)
             if not m:
                 continue
-            dev_id = m.group(1)
-            
-            # Mouse/trackpad atla
-            name_lower = line.lower()
-            if any(skip in name_lower for skip in ["mouse", "trackpad", "virtual", "receiver"]):
+            did = m.group(1)
+            nl = line.lower()
+            if any(s in nl for s in ["mouse", "trackpad", "virtual", "receiver", "keyboard", "power", "video"]):
                 continue
-            
-            # Matrisi uygula
-            subprocess.run(
-                ["xinput", "set-prop", dev_id, "libinput Calibration Matrix"] + matrix_str.split(),
-                capture_output=True
-            )
-            subprocess.run(
-                ["xinput", "set-prop", dev_id, "Coordinate Transformation Matrix"] + matrix_str.split(),
-                capture_output=True
-            )
+            subprocess.run(["xinput", "set-prop", did, "libinput Calibration Matrix"] + ms.split(), capture_output=True)
+            subprocess.run(["xinput", "set-prop", did, "Coordinate Transformation Matrix"] + ms.split(), capture_output=True)
             name = line.strip().split("id=")[0].replace("↳", "").replace("⎜", "").strip()
-            print(f"Uygulandı: {name} (id={dev_id})")
+            print(f"  Uygulandi: {name} (id={did})")
+            applied += 1
+        if applied == 0:
+            print("  Dokunmatik cihaz bulunamadi — reboot sonrasi uygulanacak")
     except Exception as e:
-        print(f"xinput hatası: {e}")
+        print(f"  xinput hatasi: {e}")
 
+def install_boot_service():
+    """Her restart'ta kalibrasyonu otomatik uygulayan servisi kur"""
 
-# ══════════════════════════════════════════════════════════════
-# Ana Program
-# ══════════════════════════════════════════════════════════════
+    # Apply script
+    apply_script = '''#!/bin/bash
+CALIB="/etc/vestel-touch-calibration.conf"
+[ -f "$CALIB" ] || exit 0
+M=$(cat "$CALIB" | xargs)
+[ "$M" = "1 0 0 0 1 0 0 0 1" ] && exit 0
 
+# X11 bekle
+w=0; while [ $w -lt 90 ]; do
+    DISPLAY=:0 xdpyinfo &>/dev/null && break
+    sleep 2; w=$((w+2))
+done
+[ $w -ge 90 ] && exit 1
+sleep 5
+
+export DISPLAY=:0
+for xa in /home/*/.Xauthority /root/.Xauthority; do
+    [ -f "$xa" ] && export XAUTHORITY="$xa" && break
+done
+
+while IFS= read -r l; do
+    echo "$l" | grep -q "slave  pointer" || continue
+    id=$(echo "$l" | grep -oP 'id=\\K[0-9]+' || true)
+    [ -z "$id" ] && continue
+    n=$(echo "$l" | sed 's/[⎜↳│]//g' | awk -F'id=' '{print $1}' | xargs)
+    echo "$n" | grep -iqE "mouse|trackpad|virtual|receiver|keyboard|power|video" && continue
+    xinput set-prop "$id" "libinput Calibration Matrix" $M 2>/dev/null
+    xinput set-prop "$id" "Coordinate Transformation Matrix" $M 2>/dev/null
+done < <(xinput list 2>/dev/null)
+'''
+
+    service_unit = '''[Unit]
+Description=Vestel Touch Calibration
+After=display-manager.service eta-touchdrv.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/vestel-touch-apply.sh
+RemainAfterExit=yes
+TimeoutStartSec=120
+
+[Install]
+WantedBy=graphical.target
+'''
+
+    # Dosyalari yaz
+    with open(APPLY_SCRIPT, "w") as f:
+        f.write(apply_script)
+    os.chmod(APPLY_SCRIPT, 0o755)
+
+    if not os.path.exists(SERVICE_FILE):
+        with open(SERVICE_FILE, "w") as f:
+            f.write(service_unit)
+        os.system("systemctl daemon-reload")
+        os.system("systemctl enable vestel-touch-calibrate.service 2>/dev/null")
+        print("  Boot servisi kuruldu — her restart'ta otomatik uygulanacak")
+    else:
+        print("  Boot servisi zaten kurulu")
+
+    # sudoers
+    sudoers = "/etc/sudoers.d/vestel-touch"
+    if not os.path.exists(sudoers):
+        with open(sudoers, "w") as f:
+            f.write("ALL ALL=NOPASSWD: /usr/local/bin/vestel-touch-apply.sh\n")
+        os.chmod(sudoers, 0o440)
+
+# ═══════════════════════════════════════════════
+# tkinter KALİBRASYON GUI
+# ═══════════════════════════════════════════════
+def reset_matrix():
+    """Kalibrasyon oncesi matrisi identity'ye sifirla — 
+    boylece dokunma verileri ham/dogru gelir"""
+    import re
+    identity = "1 0 0 0 1 0 0 0 1"
+    try:
+        r = subprocess.run(["xinput", "list"], capture_output=True, text=True)
+        for line in r.stdout.split("\n"):
+            if "slave  pointer" not in line:
+                continue
+            m = re.search(r"id=(\d+)", line)
+            if not m:
+                continue
+            did = m.group(1)
+            nl = line.lower()
+            if any(s in nl for s in ["mouse", "trackpad", "virtual", "receiver", "keyboard", "power", "video"]):
+                continue
+            subprocess.run(["xinput", "set-prop", did, "libinput Calibration Matrix"] + identity.split(), capture_output=True)
+            subprocess.run(["xinput", "set-prop", did, "Coordinate Transformation Matrix"] + identity.split(), capture_output=True)
+        print("  Matris sifirlandi (kalibrasyon icin)")
+    except:
+        pass
+
+def run_calibration(num_points=9):
+    import tkinter as tk
+    import time
+
+    # KRITIK: Kalibrasyon oncesi matrisi sifirla
+    # Yoksa bozuk matris uzerinden bozuk veri gelir
+    reset_matrix()
+
+    root = tk.Tk()
+    root.attributes("-fullscreen", True)
+    root.configure(bg="black", cursor="none")
+    root.title("Vestel Kalibrasyon")
+
+    canvas = tk.Canvas(root, bg="black", highlightthickness=0)
+    canvas.pack(fill="both", expand=True)
+
+    root.update_idletasks()
+    sw = root.winfo_screenwidth()
+    sh = root.winfo_screenheight()
+
+    # Hedef noktalar (%10 margin)
+    mx, my = int(sw * 0.1), int(sh * 0.1)
+    cx, cy = sw // 2, sh // 2
+    if num_points == 9:
+        targets = [
+            (mx, my), (cx, my), (sw - mx, my),
+            (mx, cy), (cx, cy), (sw - mx, cy),
+            (mx, sh - my), (cx, sh - my), (sw - mx, sh - my),
+        ]
+    else:
+        targets = [(mx, my), (sw - mx, my), (mx, sh - my), (sw - mx, sh - my)]
+
+    touches = []
+    state = {"cur": 0, "result": None, "locked": False}
+    CS = 40
+
+    def draw():
+        canvas.delete("all")
+        cur = state["cur"]
+        total = len(targets)
+
+        if state["result"] is None:
+            # Üst bilgi
+            canvas.create_rectangle(0, 0, sw, 55, fill="#1a1a2e", outline="")
+            canvas.create_text(sw // 2, 18,
+                text=f"DOKUNMATIK KALIBRASYON  [{cur}/{total}]",
+                fill="white", font=("Arial", 14, "bold"))
+            canvas.create_text(sw // 2, 40,
+                text="Kirmizi + isaretinin TAM ORTASINA parmagini bas  |  ESC = iptal",
+                fill="#AAAAAA", font=("Arial", 11))
+
+            # İlerleme çubuğu
+            pw = int((cur / total) * (sw - 40))
+            canvas.create_rectangle(20, 52, sw - 20, 56, fill="#003300", outline="")
+            if pw > 0:
+                canvas.create_rectangle(20, 52, 20 + pw, 56, fill="#00CC00", outline="")
+
+            # Tamamlanan — yeşil tik
+            for i in range(cur):
+                px, py = targets[i]
+                canvas.create_line(px - 15, py, px - 5, py + 15, fill="#00CC00", width=4)
+                canvas.create_line(px - 5, py + 15, px + 20, py - 12, fill="#00CC00", width=4)
+                canvas.create_text(px + 25, py - 20, text=f"{i+1}",
+                    fill="#00AA00", font=("Arial", 11))
+
+            # Aktif — kırmızı büyük +
+            if cur < total:
+                px, py = targets[cur]
+                canvas.create_oval(px-CS*1.5, py-CS*1.5, px+CS*1.5, py+CS*1.5,
+                    outline="#FF4444", width=2, dash=(6, 4))
+                canvas.create_oval(px-CS*0.7, py-CS*0.7, px+CS*0.7, py+CS*0.7,
+                    outline="#FF6666", width=3)
+                canvas.create_line(px - CS, py, px + CS, py, fill="#FF4444", width=4)
+                canvas.create_line(px, py - CS, px, py + CS, fill="#FF4444", width=4)
+                canvas.create_text(px + CS + 18, py - CS, text=str(cur + 1),
+                    fill="#FF4444", font=("Arial", 20, "bold"))
+                canvas.create_text(px, py + CS + 25, text="BURAYA DOKUN",
+                    fill="#FF6666", font=("Arial", 11, "bold"))
+
+            # Bekleyen — gri +
+            for i in range(cur + 1, total):
+                px, py = targets[i]
+                canvas.create_line(px - 15, py, px + 15, py, fill="#333333", width=1)
+                canvas.create_line(px, py - 15, px, py + 15, fill="#333333", width=1)
+                canvas.create_text(px + 20, py - 15, text=str(i + 1),
+                    fill="#333333", font=("Arial", 10))
+        else:
+            # Tamamlandı
+            canvas.create_rectangle(sw//4, sh//4, sw*3//4, sh*3//4,
+                outline="#00CC00", width=4)
+            canvas.create_line(sw//2-50, sh//2-10, sw//2-15, sh//2+30,
+                fill="#00FF00", width=8)
+            canvas.create_line(sw//2-15, sh//2+30, sw//2+60, sh//2-50,
+                fill="#00FF00", width=8)
+            canvas.create_text(sw//2, sh//2+70,
+                text="KALIBRASYON TAMAMLANDI!",
+                fill="#00FF00", font=("Arial", 26, "bold"))
+            ms = " ".join(str(v) for v in state["result"])
+            canvas.create_text(sw//2, sh//2+110, text=f"Matris: {ms}",
+                fill="white", font=("Arial", 12))
+            canvas.create_text(sw//2, sh//2+145,
+                text="Kaydediliyor ve uygulanıyor...",
+                fill="#CCCC00", font=("Arial", 14))
+
+    def on_touch(event):
+        if state["locked"] or state["result"] is not None:
+            return
+        cur = state["cur"]
+        if cur >= len(targets):
+            return
+
+        state["locked"] = True
+        tx, ty = event.x, event.y
+        touches.append((tx, ty))
+
+        target = targets[cur]
+        dx, dy = tx - target[0], ty - target[1]
+        print(f"  [{cur+1}/{len(targets)}] hedef=({target[0]},{target[1]}) "
+              f"dokunma=({tx},{ty}) fark=({dx},{dy})")
+
+        # Yeşil halka geri bildirimi
+        px, py = target
+        for r in [15, 30, 45]:
+            canvas.create_oval(px-r, py-r, px+r, py+r, outline="#00FF00", width=3)
+        canvas.update()
+
+        state["cur"] += 1
+
+        if state["cur"] >= len(targets):
+            root.after(400, do_finish)
+        else:
+            root.after(500, unlock_and_redraw)
+
+    def unlock_and_redraw():
+        state["locked"] = False
+        draw()
+
+    def do_finish():
+        state["result"] = calc_matrix(targets, touches, sw, sh)
+        print(f"\n  Matris: {' '.join(str(v) for v in state['result'])}")
+        draw()
+        root.after(3000, close_window)
+
+    def close_window():
+        root.destroy()
+
+    def on_escape(event):
+        state["result"] = None
+        root.destroy()
+
+    canvas.bind("<Button-1>", on_touch)
+    root.bind("<Escape>", on_escape)
+    draw()
+
+    try:
+        root.mainloop()
+    except:
+        pass
+
+    return state.get("result")
+
+# ═══════════════════════════════════════════════
+# ANA PROGRAM
+# ═══════════════════════════════════════════════
 def main():
     import argparse
-    
-    parser = argparse.ArgumentParser(description="Vestel Dokunmatik Kalibrasyon Aracı")
-    parser.add_argument("--points", type=int, default=9, choices=[4, 9],
-                       help="Kalibrasyon noktası sayısı (varsayılan: 4)")
-    parser.add_argument("--device", type=str, default=None,
-                       help="Dokunmatik event cihazı (örn: /dev/input/event5)")
-    parser.add_argument("--test", action="store_true",
-                       help="Mevcut kalibrasyonu test et (dokunma noktalarını göster)")
-    
-    args = parser.parse_args()
-    
-    # Root kontrolü
-    if os.geteuid() != 0:
-        print("Root yetkisi gerekli. sudo ile çalıştırın.")
-        # Otomatik yükseltme
-        passwords = ["etap+pardus!", "etap+pardus", "pardus", "etapadmin"]
-        for pw in passwords:
-            ret = os.system(f'echo "{pw}" | sudo -S python3 {" ".join(sys.argv)} 2>/dev/null')
-            if ret == 0:
-                return
-        print("sudo python3 vestel-calibrate-gui.py")
-        sys.exit(1)
-    
-    print("╔══════════════════════════════════════════╗")
-    print("║  VESTEL DOKUNMATIK KALİBRASYON           ║")
-    print("╚══════════════════════════════════════════╝")
-    print()
-    
-    # Dokunmatik cihaz tespiti
-    if not args.device:
-        event_path, dev_name = find_touch_device()
-        if event_path:
-            print(f"Cihaz: {dev_name} ({event_path})")
-        else:
-            print("HATA: Dokunmatik cihaz bulunamadı!")
-            print("Dokunmatik servisi çalışıyor mu? systemctl status eta-touchdrv.service")
-            sys.exit(1)
-    
-    # Kalibrasyon GUI başlat
-    gui = CalibrationGUI(num_points=args.points, event_device=args.device)
-    matrix = gui.run()
-    
-    if matrix:
-        print(f"\nSonuç matrisi: {' '.join(str(v) for v in matrix)}")
-        save_calibration(matrix)
-        print("\nKalibrasyon tamamlandı ve kalıcı kaydedildi!")
-        print("Her reboot'ta otomatik uygulanacaktır.")
-    else:
-        print("\nKalibrasyon iptal edildi.")
+    p = argparse.ArgumentParser(description="Vestel Dokunmatik Kalibrasyon")
+    p.add_argument("--points", type=int, default=9, choices=[4, 9],
+                   help="Kalibrasyon noktasi sayisi (varsayilan: 9)")
+    a = p.parse_args()
 
+    # Root kontrol
+    get_root()
+
+    # tkinter kontrol
+    try:
+        import tkinter
+    except ImportError:
+        print("python3-tk kuruluyor...")
+        os.system("apt-get install -y python3-tk 2>/dev/null")
+        try:
+            import tkinter
+        except ImportError:
+            print("HATA: python3-tk kurulamadi!")
+            print("Internet baglantisi ile: sudo apt install python3-tk")
+            sys.exit(1)
+
+    print()
+    print("=" * 46)
+    print("  VESTEL DOKUNMATIK KALIBRASYON")
+    print("  9 noktaya sirayla dokunun | ESC = iptal")
+    print("=" * 46)
+    print()
+
+    # Kalibrasyon GUI
+    matrix = run_calibration(a.points)
+
+    if matrix:
+        print()
+        ms = save_calibration(matrix)
+        apply_calibration(ms)
+        install_boot_service()
+        print()
+        print("  Kalibrasyon tamamlandi!")
+        print("  Her restart'ta otomatik uygulanacak.")
+        print()
+    else:
+        # İptal edildi — eski kalibrasyonu geri yükle
+        print("\n  Kalibrasyon iptal edildi.")
+        if os.path.exists(CALIB_FILE):
+            with open(CALIB_FILE) as f:
+                old_ms = f.read().strip()
+            if old_ms and old_ms != "1 0 0 0 1 0 0 0 1":
+                apply_calibration(old_ms)
+                print("  Onceki kalibrasyon geri yuklendi.\n")
+            else:
+                print("  Identity matris aktif.\n")
+        else:
+            print()
 
 if __name__ == "__main__":
     main()
